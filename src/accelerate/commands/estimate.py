@@ -230,13 +230,53 @@ def estimate_command_parser(subparsers=None):
                 code present on the Hub on your local machine.""",
         default=False,
     )
+    parser.add_argument(
+        "--sequence_length",
+        "-s",
+        type=int,
+        default=None,
+        help="The sequence length to estimate activation memory for.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        "-b",
+        type=int,
+        default=1,
+        help="The batch size to estimate activation memory for.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Whether to estimate activation memory with gradient checkpointing enabled.",
+    )
+    parser.add_argument(
+        "--hidden_size",
+        type=int,
+        default=None,
+        help="The hidden size of the model. If not passed, will try to infer from config.",
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        default=None,
+        help="The number of layers of the model. If not passed, will try to infer from config.",
+    )
 
     if subparsers is not None:
         parser.set_defaults(func=estimate_command)
     return parser
 
 
-def estimate_training_usage(bytes: int, mixed_precision: str, msamp_config: Optional[str] = None) -> dict:
+def estimate_training_usage(
+    bytes: int,
+    mixed_precision: str,
+    msamp_config: Optional[str] = None,
+    batch_size: int = 1,
+    sequence_length: Optional[int] = None,
+    gradient_checkpointing: bool = False,
+    hidden_size: Optional[int] = None,
+    num_layers: Optional[int] = None,
+) -> dict:
     """
     Given an amount of `bytes` and `mixed_precision`, calculates how much training memory is needed for a batch size of
     1.
@@ -268,6 +308,20 @@ def estimate_training_usage(bytes: int, mixed_precision: str, msamp_config: Opti
         # 2x from optimizer states
         memory_sizes["optimizer"] = fp32_size * 2  # Optimizer states
         memory_sizes["step"] = memory_sizes["optimizer"]
+    if sequence_length is not None:
+        bytes_per_elem = 4 if mixed_precision == "float32" else (1 if mixed_precision in ("int8", "int4") else 2)
+        h = hidden_size if hidden_size is not None else 4096
+        l = num_layers if num_layers is not None else 32
+        if gradient_checkpointing:
+            act_mem = 2 * batch_size * sequence_length * h * l * bytes_per_elem
+        else:
+            ratio = (5 * sequence_length // h) if h > 0 else 0
+            act_mem = l * batch_size * sequence_length * h * (34 + ratio) * bytes_per_elem
+        memory_sizes["activations"] = act_mem
+        model_part = memory_sizes["model"] if memory_sizes["model"] != -1 else fp32_size
+        grad_part = memory_sizes["gradients"] if memory_sizes["gradients"] != -1 else fp32_size
+        opt_part = memory_sizes["optimizer"] if memory_sizes["optimizer"] != -1 else (fp32_size * 2)
+        memory_sizes["peak"] = model_part + grad_part + opt_part + act_mem
     return memory_sizes
 
 
@@ -287,12 +341,46 @@ def gather_data(args):
 
     total_size, largest_layer = calculate_maximum_sizes(model)
 
+    config = getattr(model, "config", None)
+    hidden_size = getattr(args, "hidden_size", None)
+    num_layers = getattr(args, "num_layers", None)
+    if hidden_size is None and config is not None:
+        for attr in ("hidden_size", "d_model", "n_embd", "dim", "hidden_dim"):
+            if hasattr(config, attr):
+                hidden_size = getattr(config, attr)
+                break
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None and hasattr(text_config, attr):
+                hidden_size = getattr(text_config, attr)
+                break
+    if num_layers is None and config is not None:
+        for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers", "n_decoder_layers"):
+            if hasattr(config, attr):
+                num_layers = getattr(config, attr)
+                break
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None and hasattr(text_config, attr):
+                num_layers = getattr(text_config, attr)
+                break
+
+    seq_len = getattr(args, "sequence_length", None)
+    batch_size = getattr(args, "batch_size", 1) or 1
+    grad_ckpt = getattr(args, "gradient_checkpointing", False)
+
     data = []
 
     for dtype in args.dtypes:
         dtype_total_size = total_size
         dtype_largest_layer = largest_layer[0]
-        dtype_training_size = estimate_training_usage(dtype_total_size, dtype)
+        dtype_training_size = estimate_training_usage(
+            dtype_total_size,
+            dtype,
+            batch_size=batch_size,
+            sequence_length=seq_len,
+            gradient_checkpointing=grad_ckpt,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+        )
         if dtype == "float16":
             dtype_total_size /= 2
             dtype_largest_layer /= 2
@@ -302,25 +390,35 @@ def gather_data(args):
         elif dtype == "int4":
             dtype_total_size /= 8
             dtype_largest_layer /= 8
-        data.append([dtype, dtype_largest_layer, dtype_total_size, dtype_training_size])
+        row = [dtype, dtype_largest_layer, dtype_total_size, dtype_training_size]
+        if seq_len is not None:
+            row.append(dtype_training_size.get("activations", 0))
+            row.append(dtype_training_size.get("peak", 0))
+        data.append(row)
     return data
 
 
 def estimate_command(args):
     data = gather_data(args)
+    has_activations = getattr(args, "sequence_length", None) is not None
     for row in data:
         for i, item in enumerate(row):
             if isinstance(item, (int, float)):
                 row[i] = convert_bytes(item)
             elif isinstance(item, dict):
-                training_usage = max(item.values())
+                training_usage = max(v for k, v in item.items() if k not in ("activations", "peak"))
                 row[i] = convert_bytes(training_usage) if training_usage != -1 else "N/A"
 
     headers = ["dtype", "Largest Layer", "Total Size", "Training using Adam"]
+    if has_activations:
+        headers.extend(["Activations", "Peak Training Memory"])
 
     title = f"Memory Usage for loading `{args.model_name}`"
     table = create_ascii_table(headers, data, title)
-    print(table)
+    try:
+        print(table)
+    except UnicodeEncodeError:
+        print(table.encode("ascii", "replace").decode("ascii"))
 
 
 def main():

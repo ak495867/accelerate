@@ -20,6 +20,7 @@ import threading
 import warnings
 import weakref
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable
 
@@ -1375,3 +1376,88 @@ class GradientState:
     def _reset_state():
         "Resets `_shared_state`, is used internally and should not be called"
         GradientState._shared_state.clear()
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    distributed_type: DistributedType = DistributedType.NO
+    local_process_index: int = 0
+    num_processes: int = 1
+    process_index: int = 0
+    device: Any = None
+    is_main_process: bool = True
+    is_local_main_process: bool = True
+    is_last_process: bool = True
+
+    @classmethod
+    def from_state(cls, state: Any = None) -> DistributedContext:
+        if state is None:
+            if PartialState._shared_state:
+                state = PartialState()
+            elif AcceleratorState._shared_state:
+                state = AcceleratorState()
+        if state is None:
+            return cls()
+        return cls(
+            distributed_type=getattr(state, "distributed_type", DistributedType.NO),
+            local_process_index=getattr(state, "local_process_index", 0),
+            num_processes=getattr(state, "num_processes", 1),
+            process_index=getattr(state, "process_index", 0),
+            device=getattr(state, "device", None),
+            is_main_process=getattr(state, "is_main_process", True),
+            is_local_main_process=getattr(state, "is_local_main_process", True),
+            is_last_process=getattr(state, "is_last_process", True),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "distributed_type": self.distributed_type,
+            "local_process_index": self.local_process_index,
+            "num_processes": self.num_processes,
+            "process_index": self.process_index,
+            "device": self.device,
+            "is_main_process": self.is_main_process,
+            "is_local_main_process": self.is_local_main_process,
+            "is_last_process": self.is_last_process,
+        }
+
+
+_CURRENT_DISTRIBUTED_CONTEXT = threading.local()
+
+
+def get_distributed_context() -> DistributedContext:
+    ctx = getattr(_CURRENT_DISTRIBUTED_CONTEXT, "context", None)
+    if ctx is not None:
+        return ctx
+    return DistributedContext.from_state()
+
+
+class AcceleratorContext:
+    def __init__(self, context: DistributedContext | None = None, **kwargs):
+        if context is None:
+            context = DistributedContext.from_state()
+            if kwargs:
+                data = context.as_dict()
+                data.update(kwargs)
+                context = DistributedContext(**data)
+        self.context = context
+        self._prev_context = None
+        self._saved_shared_state = {}
+
+    def __enter__(self):
+        self._prev_context = getattr(_CURRENT_DISTRIBUTED_CONTEXT, "context", None)
+        _CURRENT_DISTRIBUTED_CONTEXT.context = self.context
+        self._saved_shared_state = dict(PartialState._shared_state)
+        for k, v in self.context.as_dict().items():
+            PartialState._shared_state[k] = v
+            if AcceleratorState._shared_state:
+                AcceleratorState._shared_state[k] = v
+        return self.context
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _CURRENT_DISTRIBUTED_CONTEXT.context = self._prev_context
+        PartialState._shared_state.clear()
+        PartialState._shared_state.update(self._saved_shared_state)
+        if AcceleratorState._shared_state:
+            AcceleratorState._shared_state.clear()
+            AcceleratorState._shared_state.update(self._saved_shared_state)

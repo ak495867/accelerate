@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from accelerate.commands.config import get_config_parser
+from accelerate.commands.doctor import doctor_command_parser
 from accelerate.commands.env import env_command_parser
 from accelerate.commands.estimate import estimate_command_parser
 from accelerate.commands.launch import launch_command_parser
@@ -31,6 +32,7 @@ def main():
 
     # Register commands
     get_config_parser(subparsers=subparsers)
+    doctor_command_parser(subparsers=subparsers)
     estimate_command_parser(subparsers=subparsers)
     env_command_parser(subparsers=subparsers)
     launch_command_parser(subparsers=subparsers)

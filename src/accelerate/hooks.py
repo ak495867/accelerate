@@ -55,6 +55,29 @@ def _compiler_disable(fn):
 _accelerate_added_attributes = ["to", "cuda", "npu", "xpu", "mlu", "sdaa", "musa"]
 
 
+class OffloadStreamManager:
+    _instance = None
+
+    def __init__(self):
+        self.stream = None
+        if torch.cuda.is_available():
+            self.stream = torch.cuda.Stream()
+        self._pinned_buffers = {}
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def get_pinned_buffer(self, key, shape, dtype):
+        buf = self._pinned_buffers.get(key)
+        if buf is None or buf.shape != shape or buf.dtype != dtype:
+            buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+            self._pinned_buffers[key] = buf
+        return buf
+
+
 class ModelHook:
     """
     A hook that contains callbacks to be executed just before and after the forward method of a model. The difference
@@ -269,6 +292,7 @@ class AlignDevicesHook(ModelHook):
         place_submodules: bool = False,
         skip_keys: Optional[Union[str, list[str]]] = None,
         tied_params_map: Optional[dict[int, dict[torch.device, torch.Tensor]]] = None,
+        use_offload_stream: bool = False,
     ):
         self.execution_device = execution_device
         self.offload = offload
@@ -277,6 +301,8 @@ class AlignDevicesHook(ModelHook):
         self.offload_buffers = offload_buffers
         self.place_submodules = place_submodules
         self.skip_keys = skip_keys
+        self.use_offload_stream = use_offload_stream
+        self.stream_manager = OffloadStreamManager.get_instance() if use_offload_stream else None
 
         # Will contain the input device when `io_same_device=True`.
         self.input_device = None
@@ -393,6 +419,13 @@ class AlignDevicesHook(ModelHook):
                     fp16_statistics=fp16_statistics,
                     tied_params_map=self.tied_params_map,
                 )
+            if (
+                self.use_offload_stream
+                and self.stream_manager
+                and self.stream_manager.stream is not None
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.current_stream().wait_stream(self.stream_manager.stream)
 
         return send_to_device(args, self.execution_device), send_to_device(
             kwargs, self.execution_device, skip_keys=self.skip_keys

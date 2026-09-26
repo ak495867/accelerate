@@ -35,13 +35,20 @@ import torch.utils.hooks as hooks
 from accelerate.utils.dataclasses import FP8BackendType
 
 from .big_modeling import _attach_context_parallel_hooks, _refuse_recurrent_layers_under_sequence_parallelism
-from .checkpointing import load_accelerator_state, load_custom_state, save_accelerator_state, save_custom_state
+from .checkpointing import (
+    load_accelerator_state,
+    load_custom_state,
+    save_accelerator_state,
+    save_custom_state,
+    wait_for_async_save,
+)
 from .data_loader import DataLoaderDispatcher, prepare_data_loader, skip_first_batches
 from .logging import get_logger
 from .optimizer import AcceleratedOptimizer
 from .parallelism_config import ParallelismConfig
+from .preparers import DataLoaderPreparer, ModelPreparer, OptimizerPreparer, SchedulerPreparer
 from .scheduler import AcceleratedScheduler
-from .state import AcceleratorState, GradientState, PartialState
+from .state import AcceleratorContext, AcceleratorState, DistributedContext, GradientState, PartialState
 from .tracking import LOGGER_TYPE_TO_CLASS, GeneralTracker, filter_trackers
 from .utils import (
     MODEL_NAME,
@@ -620,6 +627,10 @@ class Accelerator:
         self._schedulers = []
         self._dataloaders = []
         self._custom_objects = []
+        self._dataloader_preparer = DataLoaderPreparer(self)
+        self._model_preparer = ModelPreparer(self)
+        self._optimizer_preparer = OptimizerPreparer(self)
+        self._scheduler_preparer = SchedulerPreparer(self)
 
         # Hooks
         self._load_model_state_pre_hook = OrderedDict()
@@ -1397,16 +1408,16 @@ class Accelerator:
     def _prepare_one(self, obj, first_pass=False, device_placement=None):
         # First pass of preparation: DataLoader, model, optimizer
         if first_pass:
-            if isinstance(obj, torch.utils.data.DataLoader):
-                return self.prepare_data_loader(obj, device_placement=device_placement)
-            elif isinstance(obj, torch.nn.Module):
-                return self.prepare_model(obj, device_placement=device_placement)
-            elif isinstance(obj, torch.optim.Optimizer):
-                optimizer = self.prepare_optimizer(obj, device_placement=device_placement)
+            if self._dataloader_preparer.can_prepare(obj):
+                return self._dataloader_preparer.prepare(obj, device_placement=device_placement)
+            elif self._model_preparer.can_prepare(obj):
+                return self._model_preparer.prepare(obj, device_placement=device_placement)
+            elif self._optimizer_preparer.can_prepare(obj):
+                optimizer = self._optimizer_preparer.prepare(obj, device_placement=device_placement)
                 return optimizer
         # Second pass of preparation: LR scheduler (which need the full list of optimizers)
-        elif isinstance(obj, LRScheduler):
-            scheduler = self.prepare_scheduler(obj)
+        elif self._scheduler_preparer.can_prepare(obj):
+            scheduler = self._scheduler_preparer.prepare(obj)
             return scheduler
         # Return the unprocessed object if previous criteria was not met
         return obj
@@ -3621,7 +3632,13 @@ class Accelerator:
         self._save_model_state_pre_hook[handle.id] = hook
         return handle
 
-    def save_state(self, output_dir: str | None = None, safe_serialization: bool = True, **save_model_func_kwargs):
+    def save_state(
+        self,
+        output_dir: str | None = None,
+        safe_serialization: bool = True,
+        async_save: bool = False,
+        **save_model_func_kwargs,
+    ):
         """
         Saves the current states of the model, optimizer, scaler, RNG generators, and registered objects to a folder.
 
@@ -3750,11 +3767,33 @@ class Accelerator:
             self.scaler,
             save_on_each_node=self.project_configuration.save_on_each_node,
             safe_serialization=safe_serialization,
+            async_save=async_save,
         )
         for i, obj in enumerate(self._custom_objects):
             save_custom_state(obj, output_dir, i, save_on_each_node=self.project_configuration.save_on_each_node)
         self.project_configuration.iteration += 1
         return save_location
+
+    def wait_for_save(self):
+        wait_for_async_save()
+
+    def register_preparer(self, preparer):
+        if preparer.can_prepare(torch.utils.data.DataLoader):
+            self._dataloader_preparer = preparer
+        elif preparer.can_prepare(torch.nn.Module):
+            self._model_preparer = preparer
+        elif preparer.can_prepare(torch.optim.Optimizer):
+            self._optimizer_preparer = preparer
+        elif preparer.can_prepare(LRScheduler):
+            self._scheduler_preparer = preparer
+
+    def context(self, **kwargs):
+        ctx = DistributedContext.from_state(self.state)
+        if kwargs:
+            data = ctx.as_dict()
+            data.update(kwargs)
+            ctx = DistributedContext(**data)
+        return AcceleratorContext(ctx)
 
     def register_load_state_pre_hook(self, hook: Callable[..., None]) -> hooks.RemovableHandle:
         """

@@ -297,6 +297,7 @@ from .other import (
     wait_for_everyone,
     write_basic_config,
 )
+from .flex_attention import FlexAttentionContextParallel, is_flex_attention_available
 from .random import set_seed, synchronize_rng_state, synchronize_rng_states
 from .torch_xla import install_xla
 from .tqdm import tqdm

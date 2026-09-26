@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import concurrent.futures
+import json
 import random
 from pathlib import Path
 from typing import Optional
@@ -59,6 +61,23 @@ from .state import PartialState
 
 logger = get_logger(__name__)
 
+_ASYNC_SAVE_EXECUTOR = None
+_PENDING_ASYNC_FUTURES = []
+
+
+def get_async_executor():
+    global _ASYNC_SAVE_EXECUTOR
+    if _ASYNC_SAVE_EXECUTOR is None:
+        _ASYNC_SAVE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    return _ASYNC_SAVE_EXECUTOR
+
+
+def wait_for_async_save():
+    global _PENDING_ASYNC_FUTURES
+    for fut in _PENDING_ASYNC_FUTURES:
+        fut.result()
+    _PENDING_ASYNC_FUTURES.clear()
+
 
 def save_accelerator_state(
     output_dir: str,
@@ -71,6 +90,7 @@ def save_accelerator_state(
     scaler: Optional[GradScaler] = None,
     save_on_each_node: bool = False,
     safe_serialization: bool = True,
+    async_save: bool = False,
 ) -> Path:
     """
     Saves the current states of the models, optimizers, scaler, and RNG generators to a given directory.
@@ -105,6 +125,55 @@ def save_accelerator_state(
             Whether to save the model using `safetensors` or the traditional PyTorch way (that uses `pickle`).
     """
     output_dir = Path(output_dir)
+    if async_save:
+        def _clone_state(obj):
+            if isinstance(obj, torch.Tensor):
+                if obj.is_cuda:
+                    cpu_tensor = torch.empty(obj.shape, dtype=obj.dtype, pin_memory=True)
+                    cpu_tensor.copy_(obj, non_blocking=True)
+                    return cpu_tensor
+                return obj.clone()
+            elif isinstance(obj, dict):
+                return {k: _clone_state(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [_clone_state(v) for v in obj]
+            elif isinstance(obj, tuple):
+                return tuple(_clone_state(v) for v in obj)
+            return obj
+
+        cloned_model_states = [_clone_state(s) for s in model_states]
+        cloned_optimizer_states = [_clone_state(opt.state_dict()) for opt in optimizers]
+        cloned_scheduler_states = [s.state_dict() for s in schedulers]
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+
+        def _async_worker():
+            save_accelerator_state(
+                output_dir,
+                cloned_model_states,
+                optimizers=[],
+                schedulers=[],
+                dataloaders=dataloaders,
+                process_index=process_index,
+                step=step,
+                scaler=scaler,
+                save_on_each_node=save_on_each_node,
+                safe_serialization=safe_serialization,
+                async_save=False,
+            )
+            for i, state in enumerate(cloned_optimizer_states):
+                optimizer_name = f"{OPTIMIZER_NAME}.bin" if i == 0 else f"{OPTIMIZER_NAME}_{i}.bin"
+                output_optimizer_file = output_dir.joinpath(optimizer_name)
+                save(state, output_optimizer_file, save_on_each_node=save_on_each_node, safe_serialization=False)
+            for i, state in enumerate(cloned_scheduler_states):
+                scheduler_name = f"{SCHEDULER_NAME}.bin" if i == 0 else f"{SCHEDULER_NAME}_{i}.bin"
+                output_scheduler_file = output_dir.joinpath(scheduler_name)
+                save(state, output_scheduler_file, save_on_each_node=save_on_each_node, safe_serialization=False)
+
+        fut = get_async_executor().submit(_async_worker)
+        _PENDING_ASYNC_FUTURES.append(fut)
+        return output_dir
+
     # Model states
     for i, state in enumerate(model_states):
         weights_name = WEIGHTS_NAME if not safe_serialization else SAFE_WEIGHTS_NAME
@@ -239,8 +308,38 @@ def load_accelerator_state(
     for i, model in enumerate(models):
         ending = f"_{i}" if i > 0 else ""
         input_model_file = input_dir.joinpath(f"{SAFE_MODEL_NAME}{ending}.safetensors")
+        safe_index_file = input_dir.joinpath(f"{SAFE_MODEL_NAME}{ending}.safetensors.index.json")
+        default_safe_index = input_dir.joinpath("model.safetensors.index.json")
+        bin_index_file = input_dir.joinpath(f"{MODEL_NAME}{ending}.bin.index.json")
+        default_bin_index = input_dir.joinpath("pytorch_model.bin.index.json")
         if input_model_file.exists():
             load_model(model, input_model_file, device=str(map_location), **load_model_func_kwargs)
+        elif safe_index_file.exists() or (i == 0 and default_safe_index.exists()):
+            idx_file = safe_index_file if safe_index_file.exists() else default_safe_index
+            from safetensors.torch import load_file
+
+            with open(idx_file, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            weight_map = index_data.get("weight_map", {})
+            shard_files = set(weight_map.values())
+            combined_state = {}
+            for shard_file in shard_files:
+                shard_path = input_dir.joinpath(shard_file)
+                shard_state = load_file(str(shard_path), device=str(map_location))
+                combined_state.update(shard_state)
+            model.load_state_dict(combined_state, **load_model_func_kwargs)
+        elif bin_index_file.exists() or (i == 0 and default_bin_index.exists()):
+            idx_file = bin_index_file if bin_index_file.exists() else default_bin_index
+            with open(idx_file, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            weight_map = index_data.get("weight_map", {})
+            shard_files = set(weight_map.values())
+            combined_state = {}
+            for shard_file in shard_files:
+                shard_path = input_dir.joinpath(shard_file)
+                shard_state = load(shard_path, map_location=map_location)
+                combined_state.update(shard_state)
+            model.load_state_dict(combined_state, **load_model_func_kwargs)
         else:
             # Load with torch
             input_model_file = input_dir.joinpath(f"{MODEL_NAME}{ending}.bin")

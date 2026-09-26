@@ -1153,15 +1153,22 @@ def prepare_data_loader(
             submesh_dp_size = 1
             submesh_tp_size = 1
             submesh_cp_size = 1
+            submesh_ep_size = 1
+            submesh_pp_size = 1
             if "tp" in torch_device_mesh.mesh_dim_names:
                 submesh_tp_size = torch_device_mesh["tp"].size()
             if "cp" in torch_device_mesh.mesh_dim_names:
                 submesh_cp_size = torch_device_mesh["cp"].size()
+            if "ep" in torch_device_mesh.mesh_dim_names:
+                submesh_ep_size = torch_device_mesh["ep"].size()
+            if "pp" in torch_device_mesh.mesh_dim_names:
+                submesh_pp_size = torch_device_mesh["pp"].size()
             if "dp_replicate" in torch_device_mesh.mesh_dim_names:
                 submesh_dp_size = torch_device_mesh["dp_replicate"].size()
             if "dp_shard" in torch_device_mesh.mesh_dim_names:
                 submesh_fsdp_size = torch_device_mesh["dp_shard"].size()
-            process_index = process_index // (submesh_tp_size * submesh_cp_size)
+            non_dp_mult = submesh_tp_size * submesh_cp_size * submesh_ep_size * submesh_pp_size
+            process_index = process_index // non_dp_mult
             num_processes = submesh_fsdp_size * submesh_dp_size
 
     # Sanity check
@@ -1276,6 +1283,9 @@ def prepare_data_loader(
         for k in _PYTORCH_DATALOADER_KWARGS
         if k not in ignore_kwargs
     }
+
+    if not use_stateful_dataloader and hasattr(dataloader, "state_dict") and hasattr(dataloader, "load_state_dict"):
+        use_stateful_dataloader = True
 
     # Need to provide batch_size as batch_sampler is None for Iterable dataset
     if new_batch_sampler is None:
@@ -1471,3 +1481,110 @@ def skip_first_batches(dataloader, num_batches=0):
         dataloader = MpDeviceLoaderWrapper(dataloader, device)
 
     return dataloader
+
+
+class SequencePackedDataLoader:
+    def __init__(
+        self,
+        dataset,
+        max_tokens: int = 2048,
+        batch_size: Optional[int] = None,
+        cp_size: int = 1,
+        cp_rank: int = 0,
+        pad_token_id: int = 0,
+        collate_fn: Optional[Callable] = None,
+        **kwargs,
+    ):
+        self.dataset = dataset
+        self.max_tokens = max_tokens
+        self.batch_size = batch_size
+        self.cp_size = max(1, cp_size)
+        self.cp_rank = cp_rank
+        self.pad_token_id = pad_token_id
+        self.collate_fn = collate_fn
+        self.kwargs = kwargs
+        self.use_stateful_dataloader = True
+        self._current_index = 0
+
+    def state_dict(self):
+        return {"current_index": self._current_index}
+
+    def load_state_dict(self, state_dict):
+        self._current_index = state_dict.get("current_index", 0)
+
+    def __len__(self):
+        if hasattr(self.dataset, "__len__"):
+            return max(1, len(self.dataset) // (self.batch_size or 1))
+        return 0
+
+    def _pack_and_shard(self, items):
+        if not items:
+            return None
+        if self.collate_fn is not None:
+            batch = self.collate_fn(items)
+        elif isinstance(items[0], dict):
+            batch = {}
+            for k in items[0].keys():
+                vals = [item[k] for item in items]
+                if isinstance(vals[0], torch.Tensor):
+                    batch[k] = torch.stack(vals) if vals[0].dim() > 0 else torch.tensor(vals)
+                else:
+                    batch[k] = vals
+        elif isinstance(items[0], torch.Tensor):
+            batch = torch.stack(items)
+        else:
+            batch = items
+
+        if self.cp_size > 1 and isinstance(batch, dict):
+            sharded_batch = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                    seq_len = v.size(1)
+                    chunk_size = seq_len // self.cp_size
+                    start = self.cp_rank * chunk_size
+                    end = (self.cp_rank + 1) * chunk_size if self.cp_rank != self.cp_size - 1 else seq_len
+                    sharded_batch[k] = v[:, start:end]
+                else:
+                    sharded_batch[k] = v
+            return sharded_batch
+        elif self.cp_size > 1 and isinstance(batch, torch.Tensor) and batch.dim() >= 2:
+            seq_len = batch.size(1)
+            chunk_size = seq_len // self.cp_size
+            start = self.cp_rank * chunk_size
+            end = (self.cp_rank + 1) * chunk_size if self.cp_rank != self.cp_size - 1 else seq_len
+            return batch[:, start:end]
+
+        return batch
+
+    def __iter__(self):
+        packed_buffer = []
+        current_token_count = 0
+
+        for idx, item in enumerate(self.dataset):
+            if idx < self._current_index:
+                continue
+            self._current_index = idx
+
+            item_len = 0
+            if isinstance(item, dict) and "input_ids" in item:
+                item_len = len(item["input_ids"])
+            elif isinstance(item, torch.Tensor):
+                item_len = item.numel()
+            elif isinstance(item, (list, tuple)):
+                item_len = len(item)
+
+            if current_token_count + item_len > self.max_tokens and packed_buffer:
+                yield self._pack_and_shard(packed_buffer)
+                packed_buffer = []
+                current_token_count = 0
+
+            packed_buffer.append(item)
+            current_token_count += item_len
+
+            if self.batch_size is not None and len(packed_buffer) >= self.batch_size:
+                yield self._pack_and_shard(packed_buffer)
+                packed_buffer = []
+                current_token_count = 0
+
+        if packed_buffer:
+            yield self._pack_and_shard(packed_buffer)
